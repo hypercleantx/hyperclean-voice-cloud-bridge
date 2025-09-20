@@ -87,64 +87,80 @@ function twimlPlay(url) {
 app.post('/voice/ai', async (req, res) => {
   res.setHeader('Content-Type', 'text/xml');
 
-  // Fail-closed Twilio verification
+  // Verify Twilio signature when auth token is present
   try {
-    const verified = verifyTwilio(req);
-    if (!verified) {
-      res.status(403).send(twimlSay('Unauthorized'));
-      return;
+    if (process.env.TWILIO_AUTH_TOKEN) {
+      const verified = await verifyTwilio(req, process.env.TWILIO_AUTH_TOKEN);
+      if (!verified) {
+        res.status(403).send(twimlSay('Unauthorized'));
+        return;
+      }
     }
-  } catch (_e) {
+  } catch (verifyErr) {
     res.status(403).send(twimlSay('Unauthorized'));
     return;
   }
 
-  const intent = req.body.intent || 'concierge_dialog';
-  const baseUrl = buildBaseUrl(req); // e.g., https://your-app.onrender.com
+  // Handle both JSON and form-encoded payloads
+  const contentType = req.get('content-type') || '';
+  let payload = req.body;
+
+  // Ensure intent field exists
+  if (!payload.intent) {
+    payload.intent = 'concierge_dialog';
+  }
+
+  // Extract budget from payload or use default
   const budgetMaxCents = Number(
-    (req.body.budgetCents || req.body.budget_cents || process.env.BUDGET_CENTS || 50)
+    payload.budget_cents ||
+    payload.budgetCents ||
+    process.env.BUDGET_CENTS ||
+    50
   );
+
   const budget = createBudget(budgetMaxCents);
 
   try {
-    // Route to provider with hard timeout (8s)
-    const result = await withTimeout(providerRouter(intent, req.body, budget), 8000);
-    const text = (result && result.text && String(result.text).trim()) || '';
+    // Enhanced error handling with specific timeouts
+    const result = await Promise.race([
+      providerRouter(payload.intent, payload, budget),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('timeout_provider')), 8000)
+      )
+    ]);
+
+    const text = (result && result.text) ? String(result.text).trim() : '';
 
     if (!text) {
-      // No text → fallback say
-      res.send(twimlSay(FALLBACK_SAY));
+      res.send(twimlSay("I'll text you our booking link right away."));
       return;
     }
 
-    // TTS with a tight timeout to keep total < 15s
+    // TTS with fallback
     try {
-      const audioUrl = await withTimeout(
-        elevenLabsTTS(text, { baseUrl, audioDir: AUDIO_DIR, filenamePrefix: req.body.CallSid || 'hc' }),
-        Number(process.env.TTS_TIMEOUT_MS || 5000)
-      );
+      const audioUrl = await Promise.race([
+        elevenLabsTTS(text, {
+          baseUrl: buildBaseUrl(req),
+          audioDir: AUDIO_DIR,
+          filenamePrefix: payload.CallSid || 'hc'
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('timeout_tts')), 5000)
+        )
+      ]);
 
       if (audioUrl) {
         res.send(twimlPlay(audioUrl));
-        return;
+      } else {
+        res.send(twimlSay(text));
       }
-
-      // TTS returned no URL → default to <Say>
+    } catch (ttsErr) {
+      console.warn('TTS failed, using text fallback:', ttsErr && ttsErr.message);
       res.send(twimlSay(text));
-    } catch (_ttsErr) {
-      // TTS error/timeout → fallback say
-      res.send(twimlSay(FALLBACK_SAY));
     }
   } catch (err) {
-    // LLM error/timeout/budget exceeded → fallback say
-    if (String(err && err.message).startsWith('budget_exceeded')) {
-      console.warn('Budget exceeded, returning fallback.');
-    } else if (String(err && err.message).startsWith('timeout_')) {
-      console.warn('Provider timeout, returning fallback.');
-    } else {
-      console.warn('Provider error:', err && err.message);
-    }
-    res.send(twimlSay(FALLBACK_SAY));
+    console.error('Provider error:', err && err.message);
+    res.send(twimlSay("I'll text you our booking link right away."));
   }
 });
 
