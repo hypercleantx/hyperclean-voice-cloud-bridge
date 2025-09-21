@@ -26,7 +26,7 @@ const AUDIO_DIR = process.env.AUDIO_DIR || path.join(process.cwd(), 'audio');
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
 // Parsers for Twilio form-encoded and JSON (for health/tests)
-app.use(express.urlencoded({ extended: false }));
+aapp.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // Minimal PII-safe logger
